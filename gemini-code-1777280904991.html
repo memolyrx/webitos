@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <title>SIGMA FPV DRONE SİMÜLATÖRÜ</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap');
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: 'Share Tech Mono', monospace; user-select: none; }
+        
+        /* UI ve Menü */
+        #ui { 
+            position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
+            background: rgba(0, 20, 0, 0.8); padding: 10px 20px; border-radius: 5px; 
+            border: 1px solid #0f0; color: #0f0; z-index: 100; display: flex; gap: 20px; align-items: center;
+            box-shadow: 0 0 10px #0f0; text-transform: uppercase;
+        }
+        select { background: #000; color: #0f0; border: 1px solid #0f0; padding: 5px; font-family: inherit; font-weight: bold; cursor: pointer; }
+        
+        /* OSD (Gözlük Ekranı) */
+        #osd {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none;
+            color: #fff; text-shadow: -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000; z-index: 10;
+        }
+        .osd-element { position: absolute; font-size: 20px; font-weight: bold; }
+        #osd-volt { bottom: 30px; right: 50px; }
+        #osd-amp { bottom: 60px; right: 50px; }
+        #osd-mode { bottom: 30px; left: 50px; }
+        #osd-alt { top: 50%; right: 50px; transform: translateY(-50%); }
+        #osd-spd { top: 50%; left: 50px; transform: translateY(-50%); }
+        #osd-dist { top: 30px; left: 50px; }
+        #osd-warn { top: 20%; left: 50%; transform: translate(-50%, -50%); color: red; font-size: 30px; animation: blink 0.5s infinite; display: none; }
+        
+        #crosshair { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); font-size: 24px; color: rgba(255,255,255,0.6); }
+        #horizon { width: 300px; height: 2px; background: rgba(255, 255, 255, 0.5); position: absolute; top: 50%; left: 50%; margin-left: -150px; transition: transform 0.03s linear; }
+        
+        /* VTx Parazit Efekti */
+        #vtx-noise {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background-image: repeating-radial-gradient(circle at 50% 50%, rgba(255,255,255,0.1) 0, rgba(0,0,0,0.1) 2px);
+            opacity: 0; pointer-events: none; z-index: 15; mix-blend-mode: overlay;
+        }
+        
+        @keyframes blink { 0% {opacity:1;} 50% {opacity:0;} 100% {opacity:1;} }
+        
+        /* Scanlines */
+        .scanlines {
+            position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
+            background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%); background-size: 100% 4px; pointer-events: none; z-index: 20;
+        }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+</head>
+<body>
+
+<div id="ui">
+    <div>
+        <span>Model: </span>
+        <select id="droneSelect">
+            <option value="fpv">DJI FPV (Acro)</option>
+            <option value="lito">DJI Lito X1 (Acro-Sport)</option>
+            <option value="mini5">Mini 5 Pro (Angle/Baro)</option>
+        </select>
+    </div>
+    <div>Kam: 'V' | Kontrol: Mode 2 (Sol: W,A,S,D | Sağ: Ok Tuşları)</div>
+</div>
+
+<div class="scanlines"></div>
+<div id="vtx-noise"></div>
+
+<div id="osd">
+    <div class="osd-element" id="osd-dist">DIST: 0m</div>
+    <div class="osd-element" id="osd-spd">0<br>KM/H</div>
+    <div class="osd-element" id="osd-alt">0.0<br>M</div>
+    <div class="osd-element" id="osd-mode">ACRO</div>
+    <div class="osd-element" id="osd-volt">22.2V</div>
+    <div class="osd-element" id="osd-amp">0.0A</div>
+    <div class="osd-element" id="osd-warn">LOW BATTERY / CRASH</div>
+    
+    <div id="horizon"></div>
+    <div id="crosshair">[- + -]</div>
+</div>
+
+<script>
+    // 1. SAHNE VE MOTOR
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x5c7b99);
+    scene.fog = new THREE.FogExp2(0x5c7b99, 0.002);
+    
+    const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: "high-performance" });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    document.body.appendChild(renderer.domElement);
+
+    // Kameralar (Dinamik FOV eklendi)
+    let isFPV = true; // Varsayılan FPV (Sigma kuralı)
+    const baseFpvFov = 110; // Geniş FPV açısı
+    const thirdCam = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 2000);
+    const fpvCam = new THREE.PerspectiveCamera(baseFpvFov, window.innerWidth / window.innerHeight, 0.1, 2000);
+    let activeCamera = fpvCam;
+
+    // Işıklandırma
+    scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+    const sunLight = new THREE.DirectionalLight(0xffffee, 1.2);
+    sunLight.position.set(200, 500, 200);
+    sunLight.castShadow = true;
+    sunLight.shadow.mapSize.width = 2048;
+    sunLight.shadow.mapSize.height = 2048;
+    sunLight.shadow.camera.far = 1000;
+    scene.add(sunLight);
+
+    // 2. ÇEVRE (Gerçekçi Parkur)
+    // Zemin
+    const gridHelper = new THREE.GridHelper(2000, 100, 0x00ff00, 0x222222);
+    gridHelper.position.y = 0.01;
+    scene.add(gridHelper);
+
+    const floorGeo = new THREE.PlaneGeometry(3000, 3000);
+    const floorMat = new THREE.MeshStandardMaterial({ color: 0x112211, roughness: 0.9 });
+    const floor = new THREE.Mesh(floorGeo, floorMat);
+    floor.rotation.x = -Math.PI / 2;
+    floor.receiveShadow = true;
+    scene.add(floor);
+
+    // Engeller (Kuleler)
+    const boxGeo = new THREE.BoxGeometry(10, 100, 10);
+    const boxMat = new THREE.MeshStandardMaterial({color: 0x333333});
+    for(let i=0; i<60; i++) {
+        const box = new THREE.Mesh(boxGeo, boxMat);
+        box.position.set((Math.random() - 0.5) * 1500, 50, (Math.random() - 0.5) * 1500);
+        box.castShadow = true;
+        scene.add(box);
+    }
+
+    // 3. DRONE MODELİ (Fiziksel Kütle Noktası)
+    const droneGroup = new THREE.Group();
+    scene.add(droneGroup);
+
+    const body = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.1, 0.5), new THREE.MeshStandardMaterial({color: 0x222222}));
+    body.castShadow = true;
+    droneGroup.add(body);
+
+    // FPV Kamera Yerleşimi (Kamera yukarı bakar - Uptilt 25 derece)
+    const camContainer = new THREE.Group();
+    camContainer.position.set(0, 0.1, -0.2);
+    camContainer.rotation.x = Math.PI * (25 / 180); // 25 Derece Uptilt
+    camContainer.add(fpvCam);
+    droneGroup.add(camContainer);
+
+    droneGroup.position.set(0, 0.5, 0); // Başlangıç Yeri
+
+    // 4. FİZİK MOTORU & DEĞİŞKENLER
+    const G = 9.81 * 0.0015; // Optimize edilmiş yerçekimi
+    let velocity = new THREE.Vector3(0, 0, 0);
+    let angularVel = new THREE.Vector3(0, 0, 0);
+    let wind = new THREE.Vector3(0, 0, 0);
+
+    // Batarya Sistemi (6S Pil - 25.2V Max, 19.8V Min)
+    let batteryCapacity = 1500; // mAh
+    let currentVoltage = 25.2;
+    let currentAmp = 0;
+
+    // Drone Profilleri
+    const drones = {
+        fpv: { 
+            mass: 0.8, thrustMax: 0.08, drag: 0.98, angDrag: 0.99,
+            pitchRate: 0.008, rollRate: 0.008, yawRate: 0.006, 
+            mode: "ACRO", hasBaro: false
+        },
+        lito: { 
+            mass: 0.6, thrustMax: 0.06, drag: 0.96, angDrag: 0.92,
+            pitchRate: 0.006, rollRate: 0.006, yawRate: 0.005, 
+            mode: "ACRO", hasBaro: false
+        },
+        mini5: { 
+            mass: 0.249, thrustMax: 0.03, drag: 0.92, angDrag: 0.85,
+            pitchRate: 0.004, rollRate: 0.004, yawRate: 0.003, 
+            mode: "ANGLE", hasBaro: true // İrtifa sabitleyici var
+        }
+    };
+    let currentDrone = drones.fpv;
+
+    document.getElementById('droneSelect').addEventListener('change', (e) => {
+        currentDrone = drones[e.target.value];
+        document.getElementById('osd-mode').innerText = currentDrone.mode;
+    });
+
+    // 5. GERÇEK MODE 2 KONTROLLERİ
+    // Sol Çubuk (Throttle/Gaz: W/S, Yaw/Dönüş: A/D)
+    // Sağ Çubuk (Pitch/Eğilme: Yukarı/Aşağı Ok, Roll/Yatış: Sol/Sağ Ok)
+    const sticks = {
+        throttle: 0, // 0 to 1
+        yaw: 0,      // -1 to 1
+        pitch: 0,    // -1 to 1
+        roll: 0      // -1 to 1
+    };
+
+    window.addEventListener('keydown', e => {
+        if(e.code === 'KeyW') sticks.throttle = 1;
+        if(e.code === 'KeyS') sticks.throttle = 0; // S'ye basınca gaz keser
+        if(e.code === 'KeyA') sticks.yaw = 1;
+        if(e.code === 'KeyD') sticks.yaw = -1;
+        if(e.code === 'ArrowUp') sticks.pitch = -1; // İleri eğil
+        if(e.code === 'ArrowDown') sticks.pitch = 1; // Geri eğil
+        if(e.code === 'ArrowLeft') sticks.roll = 1; // Sola yat
+        if(e.code === 'ArrowRight') sticks.roll = -1; // Sağa yat
+        if(e.code === 'KeyV') {
+            isFPV = !isFPV;
+            activeCamera = isFPV ? fpvCam : thirdCam;
+        }
+    });
+
+    window.addEventListener('keyup', e => {
+        if(e.code === 'KeyW') sticks.throttle = 0; // Yaylı değil ama simülatörde bırakınca gaz keseriz
+        if(e.code === 'KeyA' || e.code === 'KeyD') sticks.yaw = 0; // Yaylı
+        if(e.code === 'ArrowUp' || e.code === 'ArrowDown') sticks.pitch = 0; // Yaylı
+        if(e.code === 'ArrowLeft' || e.code === 'ArrowRight') sticks.roll = 0; // Yaylı
+    });
+
+    // 6. FİZİK DÖNGÜSÜ
+    let isCrashed = false;
+
+    function animate() {
+        requestAnimationFrame(animate);
+
+        if (!isCrashed && currentVoltage > 19.8) {
+            
+            // --- AÇISAL HAREKET (PITCH, ROLL, YAW) ---
+            if (currentDrone.mode === "ACRO") {
+                // Acro Mod: Çubuk sadece dönüş hızını belirler. Bırakınca açıda kalır.
+                angularVel.x += sticks.pitch * currentDrone.pitchRate;
+                angularVel.z += sticks.roll * currentDrone.rollRate;
+                angularVel.y += sticks.yaw * currentDrone.yawRate;
+                
+                // Hava sürtünmesi dönüşü hafif yavaşlatır
+                angularVel.multiplyScalar(currentDrone.angDrag);
+                
+                droneGroup.rotation.x += angularVel.x;
+                droneGroup.rotation.z += angularVel.z;
+                droneGroup.rotation.y += angularVel.y;
+            } else {
+                // Angle Mod (Mini 5 Pro): Çubuk açıyı belirler. Bırakınca düzelir.
+                const targetPitch = sticks.pitch * 0.5; // Max 0.5 radyan yatış
+                const targetRoll = sticks.roll * 0.5;
+                droneGroup.rotation.x += (targetPitch - droneGroup.rotation.x) * 0.1;
+                droneGroup.rotation.z += (targetRoll - droneGroup.rotation.z) * 0.1;
+                droneGroup.rotation.y += sticks.yaw * currentDrone.yawRate * 5; // Yaw hala döner
+            }
+
+            // --- DOĞRUSAL HAREKET (THROTTLE & LIFT) ---
+            const localUp = new THREE.Vector3(0, 1, 0);
+            localUp.applyQuaternion(droneGroup.quaternion);
+
+            let currentThrust = 0;
+
+            if (currentDrone.hasBaro) {
+                // İrtifa sabitleyici (Gaza basmazsan yerçekimini dengeler)
+                if (sticks.throttle > 0) currentThrust = currentDrone.thrustMax;
+                else currentThrust = G / localUp.y; // Hover thrust
+            } else {
+                // Saf Manuel Gaz
+                currentThrust = sticks.throttle * currentDrone.thrustMax;
+            }
+
+            // Rüzgar ve Yer Etkisi (Ground Effect)
+            let groundEffect = 0;
+            if (droneGroup.position.y < 2.0 && currentThrust > 0) {
+                groundEffect = (2.0 - droneGroup.position.y) * 0.005; // Yere yaklaştıkça sekme artar
+            }
+
+            // İvmeyi Vektöre Ekle
+            const totalThrustVec = localUp.multiplyScalar(currentThrust + groundEffect);
+            velocity.add(totalThrustVec);
+
+            // Yerçekimi ve Rüzgar
+            wind.set((Math.random()-0.5)*0.001, 0, (Math.random()-0.5)*0.001); // Hafif rüzgar
+            velocity.y -= G; 
+            velocity.add(wind);
+
+            // Hava Sürtünmesi (Aerodinamik sürüklenme)
+            velocity.multiplyScalar(currentDrone.drag);
+
+            // Pozisyonu Güncelle
+            droneGroup.position.add(velocity);
+
+            // --- BATARYA VE VTX SİMÜLASYONU ---
+            currentAmp = sticks.throttle * 40; // Max 40 Amper çekim
+            batteryCapacity -= (currentAmp * 0.0005); // Kapasite düşüşü
+            
+            // Voltaj Sag (Akım çekildikçe voltaj çöker)
+            const sag = currentAmp * 0.02;
+            currentVoltage = (19.8 + (batteryCapacity/1500) * 5.4) - sag;
+
+            // VTx Paraziti (Uzaklığa bağlı)
+            const distFromHome = Math.sqrt(droneGroup.position.x**2 + droneGroup.position.z**2);
+            const noiseElement = document.getElementById('vtx-noise');
+            if (distFromHome > 300) {
+                noiseElement.style.opacity = Math.min(1, (distFromHome - 300) / 700);
+            } else {
+                noiseElement.style.opacity = 0;
+            }
+
+            // Dinamik FOV (Hız arttıkça kamera açısı genişler)
+            const speed = velocity.length();
+            if (isFPV) {
+                fpvCam.fov = baseFpvFov + (speed * 20);
+                fpvCam.updateProjectionMatrix();
+            }
+
+            // Çarpışma Testi
+            if (droneGroup.position.y < 0.1) {
+                if (speed > 0.5 || angularVel.length() > 0.1) {
+                    isCrashed = true; // Kırım!
+                    document.getElementById('osd-warn').style.display = 'block';
+                    document.getElementById('osd-warn').innerText = "CRASH!";
+                } else {
+                    // Güvenli iniş
+                    velocity.set(0,0,0);
+                    angularVel.set(0,0,0);
+                    droneGroup.position.y = 0.1;
+                    droneGroup.rotation.x = 0;
+                    droneGroup.rotation.z = 0;
+                }
+            }
+        }
+
+        // --- KAMERA TAKİBİ (3rd Person) ---
+        if (!isFPV) {
+            const relOffset = new THREE.Vector3(0, 3, 10 + velocity.length()*5);
+            const camOffset = relOffset.applyMatrix4(droneGroup.matrixWorld);
+            thirdCam.position.lerp(camOffset, 0.1);
+            thirdCam.lookAt(droneGroup.position);
+        }
+
+        // --- OSD GÜNCELLEMELERİ ---
+        const vSpeed = velocity.length() * 50;
+        const alt = Math.max(0, droneGroup.position.y - 0.1);
+        const dist = Math.sqrt(droneGroup.position.x**2 + droneGroup.position.z**2);
+
+        document.getElementById('osd-spd').innerHTML = `${vSpeed.toFixed(0)}<br>KM/H`;
+        document.getElementById('osd-alt').innerHTML = `${alt.toFixed(1)}<br>M`;
+        document.getElementById('osd-dist').innerText = `DIST: ${dist.toFixed(0)}m`;
+        document.getElementById('osd-volt').innerText = `${Math.max(19.8, currentVoltage).toFixed(1)}V`;
+        document.getElementById('osd-amp').innerText = `${currentAmp.toFixed(1)}A`;
+
+        // Düşük Pil Uyarısı
+        if (currentVoltage < 21.0 && !isCrashed) {
+            document.getElementById('osd-warn').style.display = 'block';
+            document.getElementById('osd-warn').innerText = "LOW BATTERY";
+        } else if (!isCrashed) {
+            document.getElementById('osd-warn').style.display = 'none';
+        }
+
+        // Yapay Ufuk (Horizon)
+        const rollDeg = -droneGroup.rotation.z * (180/Math.PI);
+        const pitchPx = droneGroup.rotation.x * 150;
+        document.getElementById('horizon').style.transform = `rotate(${rollDeg}deg) translateY(${pitchPx}px)`;
+
+        renderer.render(scene, activeCamera);
+    }
+
+    window.addEventListener('resize', () => {
+        thirdCam.aspect = window.innerWidth / window.innerHeight; thirdCam.updateProjectionMatrix();
+        fpvCam.aspect = window.innerWidth / window.innerHeight; fpvCam.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    animate();
+</script>
+</body>
+</html>
